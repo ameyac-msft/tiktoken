@@ -1,15 +1,17 @@
 // This check is new and seems buggy (possibly with PyO3 interaction)
 #![allow(clippy::borrow_deref_ref)]
+extern crate libc;
 
 use std::collections::HashSet;
 use std::thread;
-
+use std::io::{Error, ErrorKind};
 use fancy_regex::Regex;
-use pyo3::exceptions;
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList, PyTuple};
-use pyo3::PyResult;
 use rustc_hash::FxHashMap as HashMap;
+
+use libc::c_char;
+use std::ffi::CStr;
+use std::ffi::CString;
+
 
 fn _byte_pair_merge(piece: &[u8], ranks: &HashMap<Vec<u8>, usize>) -> Vec<std::ops::Range<usize>> {
     let mut parts: Vec<_> = (0..piece.len()).map(|i| i..i + 1).collect();
@@ -123,8 +125,7 @@ fn hash_current_thread() -> usize {
 }
 
 const MAX_NUM_THREADS: usize = 128;
-#[pyclass]
-struct CoreBPE {
+pub struct CoreBPE {
     encoder: HashMap<Vec<u8>, usize>,
     special_tokens_encoder: HashMap<String, usize>,
     decoder: HashMap<usize, Vec<u8>>,
@@ -239,7 +240,7 @@ impl CoreBPE {
         // For the purposes of determining unstable tokens, unstable regex splitting
         // is only a problem if a split that was present disappears, since this can
         // lead to merging of tokens otherwise thought to be stable.
-        // cl100k_base makes our life hard by including the \s*[\r\n]+
+        // distaug_code_lang_100k_v2 makes our life hard by including the \s*[\r\n]+
         // pattern. This can e.g. cause "\n" + " " to become "\n \n".
         // Here is a quick and dirty fix:
         {
@@ -329,7 +330,7 @@ impl CoreBPE {
                     // But we might have introduced a regex split which would prevent merges.
                     // (particularly possible in the presence of unstable regex splits)
                     // So convert to UTF-8 and do regex splitting.
-                    // E.g. with cl100k_base "  !" gets split to " " + " !",
+                    // E.g. with distaug_code_lang_100k_v2 "  !" gets split to " " + " !",
                     // but byte_pair_encode("  !") != byte_pair_encode(" ")
                     Ok(s) => self._encode_ordinary_native(s),
 
@@ -361,7 +362,7 @@ impl CoreBPE {
         // unfortunately, they are not. That is, if adding bytes were to make a split appear in
         // unstable_bytes, this could make tokens possible which our logic would otherwise think
         // would be merged.
-        // For example, with gpt2, the use of \s+(?!\S) means that "\n\n" could
+        // For example, with reversible_50000, the use of \s+(?!\S) means that "\n\n" could
         // develop a split, e.g. "\n\n0" splits into "\n"+"\n"+"0", making "\n" a possible token.
         // Here is a quick and dirty fix:
         // This isn't right if we ever remove \s+(?!\S)
@@ -386,16 +387,14 @@ impl CoreBPE {
     }
 }
 
-#[pymethods]
 impl CoreBPE {
-    #[new]
     fn new(
         encoder: HashMap<Vec<u8>, usize>,
         special_tokens_encoder: HashMap<String, usize>,
         pattern: &str,
-    ) -> PyResult<Self> {
+    ) -> Result<Self,  std::io::Error> {
         let regex = Regex::new(pattern)
-            .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?;
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
         let special_regex = {
             let _parts = special_tokens_encoder
@@ -403,7 +402,7 @@ impl CoreBPE {
                 .map(|s| fancy_regex::escape(s))
                 .collect::<Vec<_>>();
             Regex::new(&_parts.join("|"))
-                .map_err(|e| PyErr::new::<exceptions::PyValueError, _>(e.to_string()))?
+                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?
         };
 
         let decoder: HashMap<usize, Vec<u8>> =
@@ -437,15 +436,15 @@ impl CoreBPE {
     // Encoding
     // ====================
 
-    fn encode_ordinary(&self, py: Python, text: &str) -> Vec<usize> {
+/*    fn encode_ordinary(&self, py: Python, text: &str) -> Vec<usize> {
         py.allow_threads(|| self._encode_ordinary_native(text))
     }
-
-    fn encode(&self, py: Python, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
-        py.allow_threads(|| self._encode_native(text, &allowed_special).0)
+*/
+    fn encode(&self, text: &str, allowed_special: HashSet<&str>) -> Vec<usize> {
+        self._encode_native(text, &allowed_special).0
     }
 
-    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<usize> {
+/*    fn _encode_bytes(&self, py: Python, bytes: &[u8]) -> Vec<usize> {
         py.allow_threads(|| {
             match std::str::from_utf8(bytes) {
                 Ok(text) => self._encode_ordinary_native(text),
@@ -503,12 +502,12 @@ impl CoreBPE {
         }
         byte_pair_encode(piece, &self.encoder)
     }
-
+*/
     // ====================
     // Decoding
     // ====================
 
-    fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
+/*    fn decode_bytes(&self, py: Python, tokens: Vec<usize>) -> Py<PyBytes> {
         let bytes = py.allow_threads(|| self._decode_native(&tokens));
         PyBytes::new(py, &bytes).into()
     }
@@ -533,12 +532,143 @@ impl CoreBPE {
             .map(|x| PyBytes::new(py, x).into())
             .collect()
     }
+*/
 }
 
-#[pymodule]
-fn _tiktoken(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<CoreBPE>()?;
-    Ok(())
+#[repr(C)]
+pub struct TokenArray {
+    length : u32,
+    tokens : *const u32
+}
+
+#[no_mangle]
+pub extern "C" fn HashMap_new() -> *mut HashMap<Vec<u8>, usize> {
+    Box::into_raw(Box::new(HashMap::default()))
+}
+
+#[no_mangle]
+pub extern "C" fn HashMap_add(
+    ptr: *mut HashMap<Vec<u8>, usize>,
+    key: *const u8,
+    key_size: usize,
+    value: usize)
+{
+    let hash = unsafe {
+        assert!(!ptr.is_null());
+        &mut *ptr
+    };
+
+    let key_slice = unsafe {
+        std::slice::from_raw_parts(key, key_size)
+    };
+
+    let key_vec = key_slice.to_vec();
+    hash.insert(key_vec, value);
+}
+
+#[no_mangle]
+pub extern "C" fn HashMap_print(ptr: *mut HashMap<Vec<u8>, usize>)
+{
+    let hash = unsafe {
+        assert!(!ptr.is_null());
+        &mut *ptr
+    };
+
+    for (key, value) in hash {
+        let s = std::string::String::from_utf8_lossy(key);
+        println!("{} / {}", s, value);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn HashMap_free(ptr: *mut HashMap<Vec<u8>, usize>)
+{
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(ptr);
+    }
+}
+
+
+#[no_mangle]
+pub extern "C" fn CoreBPE_new(
+    ranks_ptr: *mut HashMap<Vec<u8>, usize>,
+    special_syms_ptr: *mut HashMap<Vec<u8>, usize>,
+    pat: *const c_char) -> *mut CoreBPE {
+
+    let ranks = unsafe {
+        assert!(!ranks_ptr.is_null());
+        &mut *ranks_ptr
+    };
+
+    let mut special_syms_vec = unsafe { 
+        assert!(!special_syms_ptr.is_null());
+        &mut *special_syms_ptr
+    };
+
+    let mut special_syms : HashMap<String, usize> = HashMap::default();
+
+    for (key, value) in special_syms_vec {
+        let keyStr = std::string::String::from_utf8_lossy(key).to_string();
+        special_syms.insert(keyStr, value.clone());
+    }
+
+    let pat_cstr = unsafe {
+       assert!(!pat.is_null());
+       CStr::from_ptr(pat)
+    };
+
+    let pat_str = pat_cstr.to_str().unwrap();
+    /* let coreBPE_int = CoreBPE::new(ranks.clone(), special_syms.clone(), pat_str);
+    match coreBPE_int {
+      Ok(f)=> {
+         println!("init successful");
+      },
+      Err(e)=> {
+         println!("Init failed with error: {}",e.to_string());   //handled error
+      }
+	}
+    */
+    Box::into_raw(Box::new(CoreBPE::new(ranks.clone(), special_syms.clone(), pat_str).unwrap()))
+}
+
+#[no_mangle]
+pub extern "C" fn CoreBPE_encode(
+    CoreBPE_ptr: *mut CoreBPE,
+    text: *const c_char
+    ) -> usize {
+
+    let core_bpe = unsafe {
+        assert!(!CoreBPE_ptr.is_null());
+        &mut *CoreBPE_ptr
+    };
+
+    let text_cstr = unsafe {
+       assert!(!text.is_null());
+       CStr::from_ptr(text)
+    };
+
+    let text_str = text_cstr.to_str().unwrap();
+
+    //let allowed_syms : HashSet<&str>  = HashSet::default();
+
+    //let tokens = core_bpe.encode(text_str, allowed_syms);
+    let tokens = core_bpe._encode_ordinary_native(text_str);
+
+    //println!("Getting tokens successful");
+    tokens.len()
+}
+
+#[no_mangle]
+pub extern "C" fn CoreBPE_free(ptr: *mut CoreBPE) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(ptr);
+    }
 }
 
 #[cfg(test)]
